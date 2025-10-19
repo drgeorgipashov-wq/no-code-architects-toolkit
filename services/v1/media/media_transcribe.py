@@ -1,156 +1,266 @@
+# services/v1/media/media_transcribe.py
 # Copyright (c) 2025 Stephen G. Pope
 #
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-
+# GPL-2.0-or-later
 
 import os
+import json
+import shlex
+import logging
+import subprocess
+from datetime import timedelta
+
 import whisper
 import srt
-from datetime import timedelta
-from whisper.utils import WriteSRT, WriteVTT
+
 from services.file_management import download_file
-import logging
 from config import LOCAL_STORAGE_PATH
 
-# Set up logging
+# Logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def process_transcribe_media(media_url, task, include_text, include_srt, include_segments, word_timestamps, response_type, language, job_id, words_per_line=None):
-    """Transcribe or translate media and return the transcript/translation, SRT or VTT file path."""
-    logger.info(f"Starting {task} for media URL: {media_url}")
+
+def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
+    """
+    Конвертира входния аудио/видео файл до 16 kHz, моно, PCM s16le WAV,
+    което често елиминира грешките 'Invalid data found when processing input'
+    и стабилизира транскрипцията.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", src_path,
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
+        dst_path,
+    ]
+    logger.info("FFmpeg normalize: %s", " ".join(shlex.quote(x) for x in cmd))
+    try:
+        # Захващаме stderr за по-добри грешки в логовете
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        # Показваме реалния stderr на ffmpeg
+        stderr = (e.stderr or b"").decode("utf-8", errors="ignore")
+        logger.error("FFmpeg failed: %s", stderr)
+        raise RuntimeError(f"FFmpeg conversion failed: {stderr}") from e
+
+
+def _safe_unlink(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        logger.warning("Failed to remove temp file %s: %s", path, e)
+
+
+def process_transcribe_media(
+    media_url,
+    task,
+    include_text,
+    include_srt,
+    include_segments,
+    word_timestamps,
+    response_type,
+    language,
+    job_id,
+    words_per_line=None
+):
+    """
+    Транскрибира/превежда медия и връща текст/SRT/segments или пътища към файлове.
+    """
+    logger.info("Starting %s for media URL: %s", task, media_url)
+
+    # 1) Download
     input_filename = download_file(media_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
-    logger.info(f"Downloaded media to local file: {input_filename}")
+    logger.info("Downloaded media to local file: %s", input_filename)
+
+    # 2) FFmpeg -> clean WAV (16k/mono/pcm_s16le)
+    clean_wav = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_clean.wav")
+    _run_ffmpeg_to_wav(input_filename, clean_wav)
+
+    # 3) Whisper config от ENV (с разумни дефолти)
+    model_size = os.getenv("WHISPER_MODEL", "large-v3")
+    env_language = os.getenv("WHISPER_LANGUAGE", "").strip()
+    env_beam = os.getenv("WHISPER_BEAM_SIZE", "5").strip()
+    env_temps = os.getenv("WHISPER_TEMPERATURES", "0").strip()
+    env_prompt = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
+
+    # Приоритет: подаденият параметър language > ENV > None
+    language = (language or env_language or None)
 
     try:
-        # Load Whisper model (NOW configurable via env; default to large-v3 for best BG accuracy)
-        model_size = os.getenv("WHISPER_MODEL", "large-v3")
-        model = whisper.load_model(model_size)
-        logger.info(f"Loaded Whisper {model_size} model")
+        beam_size = int(env_beam)
+    except Exception:
+        beam_size = 5
 
-        # Configure transcription/translation options
-        options = {
-            "task": task,
-            "word_timestamps": word_timestamps,
-            "verbose": False
-        }
+    try:
+        # Поддържа списък: "0,0.2,0.4" или единична стойност: "0"
+        temperatures = [float(t) for t in env_temps.split(",") if t != ""]
+        if not temperatures:
+            temperatures = [0.0]
+        temperature_param = temperatures[0] if len(temperatures) == 1 else temperatures
+    except Exception:
+        temperature_param = 0.0
 
-        # Add language specification if provided
-        if language:
-            options["language"] = language
+    initial_prompt = env_prompt or None
 
-        result = model.transcribe(input_filename, **options)
-        
-        # For translation task, the result['text'] will be in English
-        text = None
-        srt_text = None
-        segments_json = None
+    # 4) Зареждаме модела
+    logger.info("Loading Whisper model: %s", model_size)
+    model = whisper.load_model(model_size)
+    logger.info("Loaded Whisper %s model", model_size)
 
-        logger.info(f"Generated {task} output")
+    # 5) Опции към transcribe()
+    # Забележка: fp16=False елиминира досадното предупреждение на CPU.
+    options = {
+        "task": task,  # "transcribe" или "translate"
+        "language": language,
+        "beam_size": beam_size,
+        "temperature": temperature_param,
+        "initial_prompt": initial_prompt,
+        "word_timestamps": bool(word_timestamps),
+        "verbose": False,
+        "fp16": False,
+    }
 
+    # Премахваме ключове с None, за да не override-ват дефолти вътре в библиотеката.
+    options = {k: v for k, v in options.items() if v is not None}
+
+    logger.info(
+        "Transcribe options: %s",
+        json.dumps(
+            {
+                **options,
+                "temperature": temperature_param if not isinstance(temperature_param, list) else "list",
+                "initial_prompt": bool(initial_prompt),
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    text = None
+    srt_text = None
+    segments_json = None
+
+    try:
+        # 6) Transcribe
+        result = model.transcribe(clean_wav, **options)
+        logger.info("Whisper finished %s", task)
+
+        # 7) Сглобяваме изходи
         if include_text is True:
-            text = result['text']
+            text = result.get("text", "")
 
         if include_srt is True:
             srt_subtitles = []
             subtitle_index = 1
-            
-            if words_per_line and words_per_line > 0:
-                # Collect all words and their timings
+
+            if words_per_line and words_per_line > 0 and result.get("segments"):
+                # Ако имаме word_timestamps=True, можем да вземем реалните времена по думи.
+                # Ако не — линейно разпределяме в сегмента.
                 all_words = []
                 word_timings = []
-                
-                for segment in result['segments']:
-                    words = segment['text'].strip().split()
-                    segment_start = segment['start']
-                    segment_end = segment['end']
-                    
-                    # Calculate timing for each word
-                    if words:
-                        duration_per_word = (segment_end - segment_start) / len(words)
-                        for i, word in enumerate(words):
-                            word_start = segment_start + (i * duration_per_word)
-                            word_end = word_start + duration_per_word
-                            all_words.append(word)
-                            word_timings.append((word_start, word_end))
-                
-                # Process words in chunks of words_per_line
-                current_word = 0
-                while current_word < len(all_words):
-                    # Get the next chunk of words
-                    chunk = all_words[current_word:current_word + words_per_line]
-                    
-                    # Calculate timing for this chunk
-                    chunk_start = word_timings[current_word][0]
-                    chunk_end = word_timings[min(current_word + len(chunk) - 1, len(word_timings) - 1)][1]
-                    
-                    # Create the subtitle
-                    srt_subtitles.append(srt.Subtitle(
-                        subtitle_index,
-                        timedelta(seconds=chunk_start),
-                        timedelta(seconds=chunk_end),
-                        ' '.join(chunk)
-                    ))
+
+                for seg in result["segments"]:
+                    seg_text = seg.get("text", "").strip()
+                    if not seg_text:
+                        continue
+
+                    words = seg_text.split()
+                    seg_start = float(seg.get("start", 0.0))
+                    seg_end = float(seg.get("end", seg_start))
+
+                    if words and seg.get("words"):
+                        # Имаме истински word timestamps от Whisper
+                        for w in seg["words"]:
+                            w_text = (w.get("word") or "").strip()
+                            w_start = float(w.get("start", seg_start))
+                            w_end = float(w.get("end", w_start))
+                            if w_text:
+                                all_words.append(w_text)
+                                word_timings.append((w_start, w_end))
+                    else:
+                        # Линейно разпределение
+                        if words:
+                            dur = max(0.0, seg_end - seg_start)
+                            per = dur / len(words) if len(words) else 0.0
+                            for i, w in enumerate(words):
+                                w_start = seg_start + i * per
+                                w_end = min(seg_end, w_start + per if per > 0 else seg_end)
+                                all_words.append(w)
+                                word_timings.append((w_start, w_end))
+
+                cur = 0
+                n = len(all_words)
+                while cur < n:
+                    chunk = all_words[cur:cur + words_per_line]
+                    chunk_start = word_timings[cur][0]
+                    chunk_end = word_timings[min(cur + len(chunk) - 1, n - 1)][1]
+                    srt_subtitles.append(
+                        srt.Subtitle(
+                            subtitle_index,
+                            timedelta(seconds=chunk_start),
+                            timedelta(seconds=chunk_end),
+                            " ".join(chunk),
+                        )
+                    )
                     subtitle_index += 1
-                    current_word += words_per_line
+                    cur += words_per_line
             else:
-                # Original behavior - one subtitle per segment
-                for segment in result['segments']:
-                    start = timedelta(seconds=segment['start'])
-                    end = timedelta(seconds=segment['end'])
-                    segment_text = segment['text'].strip()
-                    srt_subtitles.append(srt.Subtitle(subtitle_index, start, end, segment_text))
-                    subtitle_index += 1
-            
+                # Едно заглавие на сегмент (класическо поведение)
+                for seg in result.get("segments", []):
+                    start = timedelta(seconds=float(seg.get("start", 0.0)))
+                    end = timedelta(seconds=float(seg.get("end", 0.0)))
+                    seg_text = (seg.get("text") or "").strip()
+                    if seg_text:
+                        srt_subtitles.append(srt.Subtitle(subtitle_index, start, end, seg_text))
+                        subtitle_index += 1
+
             srt_text = srt.compose(srt_subtitles)
 
         if include_segments is True:
-            segments_json = result['segments']
+            # Връщаме като JSON (string), за да остане съвместимо със старата логика
+            segments_json = json.dumps(result.get("segments", []), ensure_ascii=False)
 
-        os.remove(input_filename)
-        logger.info(f"Removed local file: {input_filename}")
-        logger.info(f"{task.capitalize()} successful, output type: {response_type}")
+        logger.info("Generated outputs: text=%s, srt=%s, segments=%s",
+                    bool(text), bool(srt_text), bool(segments_json))
 
+        # 8) Чистим входните временни файлове
+        _safe_unlink(input_filename)
+        _safe_unlink(clean_wav)
+
+        logger.info("%s successful, output type: %s", task.capitalize(), response_type)
+
+        # 9) Връщаме директно или записваме файлове за 'cloud'
         if response_type == "direct":
             return text, srt_text, segments_json
         else:
-            
+            text_filename = None
+            srt_filename = None
+            segments_filename = None
+
             if include_text is True:
                 text_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.txt")
-                with open(text_filename, 'w') as f:
-                    f.write(text)
-            else:
-                text_file = None
-            
+                with open(text_filename, "w", encoding="utf-8") as f:
+                    f.write(text or "")
+
             if include_srt is True:
                 srt_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.srt")
-                with open(srt_filename, 'w') as f:
-                    f.write(srt_text)
-            else:
-                srt_filename = None
+                with open(srt_filename, "w", encoding="utf-8") as f:
+                    f.write(srt_text or "")
 
             if include_segments is True:
                 segments_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.json")
-                with open(segments_filename, 'w') as f:
-                    f.write(str(segments_json))
-            else:
-                segments_filename = None
+                with open(segments_filename, "w", encoding="utf-8") as f:
+                    f.write(segments_json or "[]")
 
-            return text_filename, srt_filename, segments_filename 
+            return text_filename, srt_filename, segments_filename
 
     except Exception as e:
-        logger.error(f"{task.capitalize()} failed: {str(e)}")
+        # Чистим и при грешка
+        _safe_unlink(input_filename)
+        _safe_unlink(clean_wav)
+        logger.error("%s failed: %s", task.capitalize(), str(e))
         raise
