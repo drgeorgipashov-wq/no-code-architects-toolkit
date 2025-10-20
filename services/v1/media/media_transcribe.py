@@ -16,16 +16,19 @@ import srt
 from services.file_management import download_file
 from config import LOCAL_STORAGE_PATH
 
-# Logging
+# --- Logging ---
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# --- По-стабилно CPU поведение (ако не са зададени от средата) ---
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 
 def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
     """
-    Конвертира входния аудио/видео файл до 16 kHz, моно, PCM s16le WAV,
-    което често елиминира грешките 'Invalid data found when processing input'
-    и стабилизира транскрипцията.
+    Конвертира входа към 16 kHz, моно, PCM s16le WAV + loudness нормализация.
+    Помага на VAD и намалява 'дрейфа' при дълги записи.
     """
     cmd = [
         "ffmpeg",
@@ -35,14 +38,13 @@ def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
         "-ac", "1",
         "-ar", "16000",
         "-c:a", "pcm_s16le",
+        "-af", "loudnorm",           # <-- нормализация
         dst_path,
     ]
     logger.info("FFmpeg normalize: %s", " ".join(shlex.quote(x) for x in cmd))
     try:
-        # Захващаме stderr за по-добри грешки в логовете
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        # Показваме реалния stderr на ffmpeg
         stderr = (e.stderr or b"").decode("utf-8", errors="ignore")
         logger.error("FFmpeg failed: %s", stderr)
         raise RuntimeError(f"FFmpeg conversion failed: {stderr}") from e
@@ -77,15 +79,15 @@ def process_transcribe_media(
     input_filename = download_file(media_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
     logger.info("Downloaded media to local file: %s", input_filename)
 
-    # 2) FFmpeg -> clean WAV (16k/mono/pcm_s16le)
+    # 2) FFmpeg -> clean WAV (16k/mono/pcm_s16le + loudnorm)
     clean_wav = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_clean.wav")
     _run_ffmpeg_to_wav(input_filename, clean_wav)
 
     # 3) Whisper config от ENV (с разумни дефолти)
     model_size = os.getenv("WHISPER_MODEL", "large-v3")
     env_language = os.getenv("WHISPER_LANGUAGE", "").strip()
-    env_beam = os.getenv("WHISPER_BEAM_SIZE", "5").strip()
-    env_temps = os.getenv("WHISPER_TEMPERATURES", "0").strip()
+    env_beam = os.getenv("WHISPER_BEAM_SIZE", "8").strip()
+    env_temps = os.getenv("WHISPER_TEMPERATURES", "0,0.2").strip()
     env_prompt = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
 
     # Приоритет: подаденият параметър language > ENV > None
@@ -94,16 +96,16 @@ def process_transcribe_media(
     try:
         beam_size = int(env_beam)
     except Exception:
-        beam_size = 5
+        beam_size = 8
 
     try:
         # Поддържа списък: "0,0.2,0.4" или единична стойност: "0"
         temperatures = [float(t) for t in env_temps.split(",") if t != ""]
         if not temperatures:
-            temperatures = [0.0]
+            temperatures = [0.0, 0.2]
         temperature_param = temperatures[0] if len(temperatures) == 1 else temperatures
     except Exception:
-        temperature_param = 0.0
+        temperature_param = [0.0, 0.2]
 
     initial_prompt = env_prompt or None
 
@@ -112,17 +114,23 @@ def process_transcribe_media(
     model = whisper.load_model(model_size)
     logger.info("Loaded Whisper %s model", model_size)
 
-    # 5) Опции към transcribe()
-    # Забележка: fp16=False елиминира досадното предупреждение на CPU.
+    # 5) По-строги опции към transcribe() за стабилност и по-малко 'гибриш'
+    # ВАЖНО: condition_on_previous_text=False прекъсва натрупването на грешки при дълги записи.
     options = {
-        "task": task,  # "transcribe" или "translate"
+        "task": task,                      # "transcribe" или "translate"
         "language": language,
         "beam_size": beam_size,
         "temperature": temperature_param,
+        "best_of": 1,
         "initial_prompt": initial_prompt,
         "word_timestamps": bool(word_timestamps),
         "verbose": False,
-        "fp16": False,
+        "fp16": False,                     # CPU
+        "condition_on_previous_text": False,
+        "no_speech_threshold": 0.6,
+        "logprob_threshold": -1.0,
+        "compression_ratio_threshold": 2.4,
+        # опционално: "patience": 0.0,
     }
 
     # Премахваме ключове с None, за да не override-ват дефолти вътре в библиотеката.
@@ -132,8 +140,8 @@ def process_transcribe_media(
         "Transcribe options: %s",
         json.dumps(
             {
-                **options,
-                "temperature": temperature_param if not isinstance(temperature_param, list) else "list",
+                **{k: v for k, v in options.items() if k != "initial_prompt" and k != "temperature"},
+                "temperature": ("list" if isinstance(temperature_param, list) else temperature_param),
                 "initial_prompt": bool(initial_prompt),
             },
             ensure_ascii=False,
@@ -158,8 +166,6 @@ def process_transcribe_media(
             subtitle_index = 1
 
             if words_per_line and words_per_line > 0 and result.get("segments"):
-                # Ако имаме word_timestamps=True, можем да вземем реалните времена по думи.
-                # Ако не — линейно разпределяме в сегмента.
                 all_words = []
                 word_timings = []
 
@@ -173,7 +179,7 @@ def process_transcribe_media(
                     seg_end = float(seg.get("end", seg_start))
 
                     if words and seg.get("words"):
-                        # Имаме истински word timestamps от Whisper
+                        # Истински word timestamps от Whisper
                         for w in seg["words"]:
                             w_text = (w.get("word") or "").strip()
                             w_start = float(w.get("start", seg_start))
@@ -182,7 +188,7 @@ def process_transcribe_media(
                                 all_words.append(w_text)
                                 word_timings.append((w_start, w_end))
                     else:
-                        # Линейно разпределение
+                        # Линейно разпределение в рамките на сегмента
                         if words:
                             dur = max(0.0, seg_end - seg_start)
                             per = dur / len(words) if len(words) else 0.0
@@ -209,7 +215,7 @@ def process_transcribe_media(
                     subtitle_index += 1
                     cur += words_per_line
             else:
-                # Едно заглавие на сегмент (класическо поведение)
+                # Класическо поведение: един subtitle на сегмент
                 for seg in result.get("segments", []):
                     start = timedelta(seconds=float(seg.get("start", 0.0)))
                     end = timedelta(seconds=float(seg.get("end", 0.0)))
@@ -221,13 +227,14 @@ def process_transcribe_media(
             srt_text = srt.compose(srt_subtitles)
 
         if include_segments is True:
-            # Връщаме като JSON (string), за да остане съвместимо със старата логика
             segments_json = json.dumps(result.get("segments", []), ensure_ascii=False)
 
-        logger.info("Generated outputs: text=%s, srt=%s, segments=%s",
-                    bool(text), bool(srt_text), bool(segments_json))
+        logger.info(
+            "Generated outputs: text=%s, srt=%s, segments=%s",
+            bool(text), bool(srt_text), bool(segments_json)
+        )
 
-        # 8) Чистим входните временни файлове
+        # 8) Чистим временните файлове
         _safe_unlink(input_filename)
         _safe_unlink(clean_wav)
 
@@ -259,7 +266,6 @@ def process_transcribe_media(
             return text_filename, srt_filename, segments_filename
 
     except Exception as e:
-        # Чистим и при грешка
         _safe_unlink(input_filename)
         _safe_unlink(clean_wav)
         logger.error("%s failed: %s", task.capitalize(), str(e))
