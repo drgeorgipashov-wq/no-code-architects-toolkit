@@ -4,6 +4,7 @@
 # GPL-2.0-or-later
 
 import os
+import re
 import json
 import shlex
 import logging
@@ -25,6 +26,86 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MKL_NUM_THREADS", "4")
 
 
+# -----------------------------
+# Bulgarian text post-processor
+# -----------------------------
+_SENT_END = r"[.!?…]"  # включва многоточие
+_QUOTE_CHARS = "„“”»«‚‘'\""
+_DASHES = "–—-"
+
+# Чести пунктуационни и интервални нормализации за BG
+def _postprocess_bg(text: str) -> str:
+    if not text:
+        return text
+
+    t = text
+
+    # Уеднаквяване на многоточия: "..." -> "…"
+    t = re.sub(r"\.\.\.+", "…", t)
+
+    # Премахване на доп. интервали
+    t = t.replace("\u00A0", " ")                      # non-breaking space
+    t = re.sub(r"[ \t\f\v]+", " ", t)                 # multiple spaces -> single
+    t = re.sub(r"[ \t]*\n[ \t]*", "\n", t)            # trim around newlines
+    t = re.sub(r"\n{3,}", "\n\n", t)                  # max 1 празен ред
+
+    # Без интервал преди пунктуация
+    t = re.sub(r"\s+([,;:!?%{}()\[\]])".format(), r"\1", t)
+    t = re.sub(r"\s+([{}])".format(_SENT_END), r"\1", t)
+
+    # Интервал след пунктуация (освен ако следващото е край на ред/текст или затваряща кавичка/скоба)
+    t = re.sub(r"([,;:])(?=[^\s\n{}\)\]{}])".format(_QUOTE_CHARS, _SENT_END),
+               r"\1 ", t)
+    t = re.sub(r"([{}])(?=[^\s\n{}\)\]{}])".format(_SENT_END, _QUOTE_CHARS, _SENT_END),
+               r"\1 ", t)
+
+    # Двойни пунктуации -> единични (напр. „!!“ -> „!“)
+    t = re.sub(r"([,;:!?])\1+", r"\1", t)
+
+    # Елипсис + пунктуация -> само елипсис
+    t = re.sub(r"…[.!?]+", "…", t)
+
+    # Дълги тирета – нормализация и интервали около тях
+    t = re.sub(r"\s*[{}]\s*".format(_DASHES), " – ", t)
+    t = re.sub(r"\s{2,}–\s{2,}", " – ", t)
+
+    # Кавички: „ “ за български текст ако се срещнат английски
+    # Заместваме само типичните прави кавички около дума/фраза
+    t = re.sub(r'(?<!\w)"\s*([^"\n]+?)\s*"(?!\w)', r'„\1“', t)
+
+    # Главна буква в началото на текста/след нов ред/след край на изречение
+    def _cap_after(match):
+        prefix = match.group(1)
+        rest = match.group(2)
+        return prefix + (rest[0].upper() + rest[1:] if rest else "")
+
+    # Начало на текста
+    t = re.sub(r"^(\s*)([a-zа-яёїієґ])", lambda m: m.group(1) + m.group(2).upper(), t, flags=re.UNICODE)
+
+    # След нов ред
+    t = re.sub(r"(\n+\s*)([a-zа-яёїієґ])", _cap_after, t, flags=re.UNICODE)
+
+    # След пунктуация, евентуално кавичка/скоба/тире
+    t = re.sub(
+        r"([{}]\s*[{}]?\s*[({}\"]?\s*)([a-zа-яёїієґ])".format(_SENT_END, _DASHES, _QUOTE_CHARS),
+        _cap_after,
+        t,
+        flags=re.UNICODE
+    )
+
+    # Премахване на интервал преди % и единици (напр. "20 %" -> "20%")
+    t = re.sub(r"(\d+)\s+%", r"\1%", t)
+    t = re.sub(r"(\d+)\s+(кг|cm|мм|ml|мл|г|mg|мг|µg|μg)", r"\1 \2", t, flags=re.IGNORECASE)
+
+    # Мини корекции за чести артефакти (предпазливи, без агресивни „замени по речник“)
+    # Няма да пипаме медицински термини, за да избегнем неволни грешки.
+
+    # Финално подрязване
+    t = t.strip()
+
+    return t
+
+
 def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
     """
     Конвертира входа към 16 kHz, моно, PCM s16le WAV + loudness нормализация.
@@ -38,7 +119,7 @@ def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
         "-ac", "1",
         "-ar", "16000",
         "-c:a", "pcm_s16le",
-        "-af", "loudnorm",           # <-- нормализация
+        "-af", "loudnorm",           # нормализация на силата
         dst_path,
     ]
     logger.info("FFmpeg normalize: %s", " ".join(shlex.quote(x) for x in cmd))
@@ -88,7 +169,18 @@ def process_transcribe_media(
     env_language = os.getenv("WHISPER_LANGUAGE", "").strip()
     env_beam = os.getenv("WHISPER_BEAM_SIZE", "8").strip()
     env_temps = os.getenv("WHISPER_TEMPERATURES", "0,0.2").strip()
-    env_prompt = os.getenv("WHISPER_INITIAL_PROMPT", "").strip()
+
+    # ДЕФОЛТЕН ПРОМПТ (ако няма зададен WHISPER_INITIAL_PROMPT в средата)
+    DEFAULT_MED_PROMPT = (
+        "Медицински консултации. Термини: щитовидна жлеза, терапия, лечение, "
+        "хормони, оплаквания, симптоми, кръвни изследвания, ехографии, "
+        "попълване на дигитален дневник, дати, промени, килограми, височина, "
+        "лекарства, хранителни добавки."
+    )
+    env_prompt = os.getenv("WHISPER_INITIAL_PROMPT", DEFAULT_MED_PROMPT).strip()
+
+    # Нормализатор: включен по подразбиране; може да се изключи с WHISPER_BG_NORMALIZE=false
+    normalize_bg = os.getenv("WHISPER_BG_NORMALIZE", "true").strip().lower() not in ("0", "false", "no")
 
     # Приоритет: подаденият параметър language > ENV > None
     language = (language or env_language or None)
@@ -115,7 +207,6 @@ def process_transcribe_media(
     logger.info("Loaded Whisper %s model", model_size)
 
     # 5) По-строги опции към transcribe() за стабилност и по-малко 'гибриш'
-    # ВАЖНО: condition_on_previous_text=False прекъсва натрупването на грешки при дълги записи.
     options = {
         "task": task,                      # "transcribe" или "translate"
         "language": language,
@@ -130,23 +221,26 @@ def process_transcribe_media(
         "no_speech_threshold": 0.6,
         "logprob_threshold": -1.0,
         "compression_ratio_threshold": 2.4,
-        # опционално: "patience": 0.0,
     }
 
-    # Премахваме ключове с None, за да не override-ват дефолти вътре в библиотеката.
+    # Премахваме ключове с None
     options = {k: v for k, v in options.items() if v is not None}
 
     logger.info(
         "Transcribe options: %s",
         json.dumps(
             {
-                **{k: v for k, v in options.items() if k != "initial_prompt" and k != "temperature"},
+                **{k: v for k, v in options.items() if k not in ("initial_prompt", "temperature")},
                 "temperature": ("list" if isinstance(temperature_param, list) else temperature_param),
                 "initial_prompt": bool(initial_prompt),
+                "normalize_bg": normalize_bg,
             },
             ensure_ascii=False,
         ),
     )
+    logger.info("Initial prompt enabled: %s (len=%d)",
+                "YES" if initial_prompt else "NO",
+                len(initial_prompt or ""))
 
     text = None
     srt_text = None
@@ -157,9 +251,10 @@ def process_transcribe_media(
         result = model.transcribe(clean_wav, **options)
         logger.info("Whisper finished %s", task)
 
-        # 7) Сглобяваме изходи
+        # 7) Пост-процес и сглобяване на изходи
         if include_text is True:
-            text = result.get("text", "")
+            raw_text = result.get("text", "")
+            text = _postprocess_bg(raw_text) if normalize_bg else raw_text
 
         if include_srt is True:
             srt_subtitles = []
@@ -170,7 +265,7 @@ def process_transcribe_media(
                 word_timings = []
 
                 for seg in result["segments"]:
-                    seg_text = seg.get("text", "").strip()
+                    seg_text = (seg.get("text") or "").strip()
                     if not seg_text:
                         continue
 
@@ -201,15 +296,18 @@ def process_transcribe_media(
                 cur = 0
                 n = len(all_words)
                 while cur < n:
-                    chunk = all_words[cur:cur + words_per_line]
+                    chunk_words = all_words[cur:cur + words_per_line]
                     chunk_start = word_timings[cur][0]
-                    chunk_end = word_timings[min(cur + len(chunk) - 1, n - 1)][1]
+                    chunk_end = word_timings[min(cur + len(chunk_words) - 1, n - 1)][1]
+                    chunk_text = " ".join(chunk_words)
+                    chunk_text = _postprocess_bg(chunk_text) if normalize_bg else chunk_text
+
                     srt_subtitles.append(
                         srt.Subtitle(
                             subtitle_index,
                             timedelta(seconds=chunk_start),
                             timedelta(seconds=chunk_end),
-                            " ".join(chunk),
+                            chunk_text,
                         )
                     )
                     subtitle_index += 1
@@ -221,13 +319,22 @@ def process_transcribe_media(
                     end = timedelta(seconds=float(seg.get("end", 0.0)))
                     seg_text = (seg.get("text") or "").strip()
                     if seg_text:
+                        seg_text = _postprocess_bg(seg_text) if normalize_bg else seg_text
                         srt_subtitles.append(srt.Subtitle(subtitle_index, start, end, seg_text))
                         subtitle_index += 1
 
             srt_text = srt.compose(srt_subtitles)
 
         if include_segments is True:
-            segments_json = json.dumps(result.get("segments", []), ensure_ascii=False)
+            # segments.json пазим „както е“ от Whisper (за дебъг),
+            # но добавяме и normalized_text за удобство
+            segs = []
+            for seg in result.get("segments", []):
+                seg_copy = dict(seg)
+                raw_seg_text = (seg_copy.get("text") or "").strip()
+                seg_copy["normalized_text"] = _postprocess_bg(raw_seg_text) if normalize_bg else raw_seg_text
+                segs.append(seg_copy)
+            segments_json = json.dumps(segs, ensure_ascii=False)
 
         logger.info(
             "Generated outputs: text=%s, srt=%s, segments=%s",
