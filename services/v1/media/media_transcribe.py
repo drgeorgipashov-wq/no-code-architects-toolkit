@@ -25,7 +25,6 @@ logging.basicConfig(level=logging.INFO)
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("MKL_NUM_THREADS", "4")
 
-
 # -----------------------------
 # Bulgarian text post-processor
 # -----------------------------
@@ -33,78 +32,34 @@ _SENT_END = r"[.!?…]"  # включва многоточие
 _QUOTE_CHARS = "„“”»«‚‘'\""
 _DASHES = "–—-"
 
-# Чести пунктуационни и интервални нормализации за BG
 def _postprocess_bg(text: str) -> str:
     if not text:
         return text
-
     t = text
-
-    # Уеднаквяване на многоточия: "..." -> "…"
-    t = re.sub(r"\.\.\.+", "…", t)
-
-    # Премахване на доп. интервали
-    t = t.replace("\u00A0", " ")                      # non-breaking space
-    t = re.sub(r"[ \t\f\v]+", " ", t)                 # multiple spaces -> single
-    t = re.sub(r"[ \t]*\n[ \t]*", "\n", t)            # trim around newlines
-    t = re.sub(r"\n{3,}", "\n\n", t)                  # max 1 празен ред
-
-    # Без интервал преди пунктуация
-    t = re.sub(r"\s+([,;:!?%{}()\[\]])".format(), r"\1", t)
+    t = re.sub(r"\.\.\.+", "…", t)                                # "..." -> "…"
+    t = t.replace("\u00A0", " ")
+    t = re.sub(r"[ \t\f\v]+", " ", t)
+    t = re.sub(r"[ \t]*\n[ \t]*", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"\s+([,;:!?%{}()\[\]])".format(), r"\1", t)       # без интервал преди пунктуация
     t = re.sub(r"\s+([{}])".format(_SENT_END), r"\1", t)
-
-    # Интервал след пунктуация (освен ако следващото е край на ред/текст или затваряща кавичка/скоба)
-    t = re.sub(r"([,;:])(?=[^\s\n{}\)\]{}])".format(_QUOTE_CHARS, _SENT_END),
-               r"\1 ", t)
-    t = re.sub(r"([{}])(?=[^\s\n{}\)\]{}])".format(_SENT_END, _QUOTE_CHARS, _SENT_END),
-               r"\1 ", t)
-
-    # Двойни пунктуации -> единични (напр. „!!“ -> „!“)
-    t = re.sub(r"([,;:!?])\1+", r"\1", t)
-
-    # Елипсис + пунктуация -> само елипсис
-    t = re.sub(r"…[.!?]+", "…", t)
-
-    # Дълги тирета – нормализация и интервали около тях
-    t = re.sub(r"\s*[{}]\s*".format(_DASHES), " – ", t)
+    t = re.sub(r"([,;:])(?=[^\s\n{}\)\]{}])".format(_QUOTE_CHARS, _SENT_END), r"\1 ", t)
+    t = re.sub(r"([{}])(?=[^\s\n{}\)\]{}])".format(_SENT_END, _QUOTE_CHARS, _SENT_END), r"\1 ", t)
+    t = re.sub(r"([,;:!?])\1+", r"\1", t)                          # двойни пунктуации
+    t = re.sub(r"…[.!?]+", "…", t)                                 # елипсис + пунктуация
+    t = re.sub(r"\s*[{}]\s*".format(_DASHES), " – ", t)            # тирета
     t = re.sub(r"\s{2,}–\s{2,}", " – ", t)
-
-    # Кавички: „ “ за български текст ако се срещнат английски
-    # Заместваме само типичните прави кавички около дума/фраза
-    t = re.sub(r'(?<!\w)"\s*([^"\n]+?)\s*"(?!\w)', r'„\1“', t)
-
-    # Главна буква в началото на текста/след нов ред/след край на изречение
-    def _cap_after(match):
-        prefix = match.group(1)
-        rest = match.group(2)
-        return prefix + (rest[0].upper() + rest[1:] if rest else "")
-
-    # Начало на текста
+    t = re.sub(r'(?<!\w)"\s*([^"\n]+?)\s*"(?!\w)', r'„\1“', t)     # кавички
+    # Главна буква в началото/след нов ред/след край на изречение
     t = re.sub(r"^(\s*)([a-zа-яёїієґ])", lambda m: m.group(1) + m.group(2).upper(), t, flags=re.UNICODE)
-
-    # След нов ред
+    def _cap_after(m):
+        prefix, rest = m.group(1), m.group(2)
+        return prefix + (rest[0].upper() + rest[1:] if rest else "")
     t = re.sub(r"(\n+\s*)([a-zа-яёїієґ])", _cap_after, t, flags=re.UNICODE)
-
-    # След пунктуация, евентуално кавичка/скоба/тире
-    t = re.sub(
-        r"([{}]\s*[{}]?\s*[({}\"]?\s*)([a-zа-яёїієґ])".format(_SENT_END, _DASHES, _QUOTE_CHARS),
-        _cap_after,
-        t,
-        flags=re.UNICODE
-    )
-
-    # Премахване на интервал преди % и единици (напр. "20 %" -> "20%")
+    t = re.sub(r"([{}]\s*[{}]?\s*[({}\"]?\s*)([a-zа-яёїієґ])".format(_SENT_END, _DASHES, _QUOTE_CHARS), _cap_after, t, flags=re.UNICODE)
     t = re.sub(r"(\d+)\s+%", r"\1%", t)
     t = re.sub(r"(\d+)\s+(кг|cm|мм|ml|мл|г|mg|мг|µg|μg)", r"\1 \2", t, flags=re.IGNORECASE)
-
-    # Мини корекции за чести артефакти (предпазливи, без агресивни „замени по речник“)
-    # Няма да пипаме медицински термини, за да избегнем неволни грешки.
-
-    # Финално подрязване
-    t = t.strip()
-
-    return t
-
+    return t.strip()
 
 def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
     """
@@ -119,7 +74,7 @@ def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
         "-ac", "1",
         "-ar", "16000",
         "-c:a", "pcm_s16le",
-        "-af", "loudnorm",           # нормализация на силата
+        "-af", "loudnorm",
         dst_path,
     ]
     logger.info("FFmpeg normalize: %s", " ".join(shlex.quote(x) for x in cmd))
@@ -130,14 +85,12 @@ def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
         logger.error("FFmpeg failed: %s", stderr)
         raise RuntimeError(f"FFmpeg conversion failed: {stderr}") from e
 
-
 def _safe_unlink(path: str) -> None:
     try:
         if path and os.path.exists(path):
             os.remove(path)
     except Exception as e:
         logger.warning("Failed to remove temp file %s: %s", path, e)
-
 
 def process_transcribe_media(
     media_url,
@@ -164,40 +117,44 @@ def process_transcribe_media(
     clean_wav = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_clean.wav")
     _run_ffmpeg_to_wav(input_filename, clean_wav)
 
-    # 3) Whisper config от ENV (с разумни дефолти)
+    # 3) Whisper config и профили от ENV
     model_size = os.getenv("WHISPER_MODEL", "large-v3")
     env_language = os.getenv("WHISPER_LANGUAGE", "").strip()
-    env_beam = os.getenv("WHISPER_BEAM_SIZE", "8").strip()
-    env_temps = os.getenv("WHISPER_TEMPERATURES", "0,0.2").strip()
+    profile = os.getenv("WHISPER_PROFILE", "strict").strip().lower()  # strict | balanced
 
     # ДЕФОЛТЕН ПРОМПТ (ако няма зададен WHISPER_INITIAL_PROMPT в средата)
     DEFAULT_MED_PROMPT = (
-        "Медицински консултации. Термини: щитовидна жлеза, терапия, лечение, "
-        "хормони, оплаквания, симптоми, кръвни изследвания, ехографии, "
-        "попълване на дигитален дневник, дати, промени, килограми, височина, "
-        "лекарства, хранителни добавки."
+        "Говорим на български език. Медицински консултации (ендокринология). "
+        "Използвай точни български термини и избягвай английски думи. "
+        "Контекст: щитовидна жлеза, хормони (TSH, T3, T4, пролактин, естроген, прогестерон), "
+        "симптоми и оплаквания, кръвни изследвания, ехографии, терапия, лечение, дозиране, "
+        "дигитален дневник, дати, промени, килограми, височина, лекарства, хранителни добавки, "
+        "морски келп/йод, витамин D, магнезий. Пунктуация и правопис на български."
     )
     env_prompt = os.getenv("WHISPER_INITIAL_PROMPT", DEFAULT_MED_PROMPT).strip()
-
-    # Нормализатор: включен по подразбиране; може да се изключи с WHISPER_BG_NORMALIZE=false
-    normalize_bg = os.getenv("WHISPER_BG_NORMALIZE", "true").strip().lower() not in ("0", "false", "no")
 
     # Приоритет: подаденият параметър language > ENV > None
     language = (language or env_language or None)
 
-    try:
-        beam_size = int(env_beam)
-    except Exception:
-        beam_size = 8
-
-    try:
-        # Поддържа списък: "0,0.2,0.4" или единична стойност: "0"
-        temperatures = [float(t) for t in env_temps.split(",") if t != ""]
+    # Профилни настройки
+    if profile == "balanced":
+        beam_size = int(os.getenv("WHISPER_BEAM_SIZE", "5").strip() or 5)
+        temperatures_env = os.getenv("WHISPER_TEMPERATURES", "0,0.2").strip()
+        temperatures = [float(t) for t in temperatures_env.split(",") if t != ""]
         if not temperatures:
             temperatures = [0.0, 0.2]
-        temperature_param = temperatures[0] if len(temperatures) == 1 else temperatures
-    except Exception:
-        temperature_param = [0.0, 0.2]
+        temperature_param = temperatures if len(temperatures) > 1 else temperatures[0]
+        logprob_threshold = float(os.getenv("WHISPER_LOGPROB_THRESHOLD", "-1.0"))
+        compression_ratio_threshold = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "2.4"))
+    else:
+        # STRICT: минимална „креативност“, максимален реализъм
+        beam_size = 1                              # Greedy decoding
+        temperature_param = [0.0]                 # само 0.0
+        logprob_threshold = -0.25                 # по-строго от дефолтите
+        compression_ratio_threshold = 2.0         # по-строго от 2.4
+
+    # Нормализатор: включен по подразбиране; може да се изключи с WHISPER_BG_NORMALIZE=false
+    normalize_bg = os.getenv("WHISPER_BG_NORMALIZE", "true").strip().lower() not in ("0", "false", "no")
 
     initial_prompt = env_prompt or None
 
@@ -206,9 +163,10 @@ def process_transcribe_media(
     model = whisper.load_model(model_size)
     logger.info("Loaded Whisper %s model", model_size)
 
-    # 5) По-строги опции към transcribe() за стабилност и по-малко 'гибриш'
+    # 5) Опции към transcribe()
+    # condition_on_previous_text=False -> прекъсва грешките, които се „натрупват“ при дълги записи
     options = {
-        "task": task,                      # "transcribe" или "translate"
+        "task": task,                               # "transcribe" или "translate"
         "language": language,
         "beam_size": beam_size,
         "temperature": temperature_param,
@@ -216,11 +174,14 @@ def process_transcribe_media(
         "initial_prompt": initial_prompt,
         "word_timestamps": bool(word_timestamps),
         "verbose": False,
-        "fp16": False,                     # CPU
+        "fp16": False,                              # CPU
         "condition_on_previous_text": False,
         "no_speech_threshold": 0.6,
-        "logprob_threshold": -1.0,
-        "compression_ratio_threshold": 2.4,
+        "logprob_threshold": logprob_threshold,
+        "compression_ratio_threshold": compression_ratio_threshold,
+        "temperature_increment_on_fallback": 0.2,   # по-контролирани fallback-и
+        # "suppress_tokens": [-1],                  # използвай вградените потиснати токени; оставяме по подразбиране
+        # "patience": 0.0,                          # за beam; при greedy няма ефект
     }
 
     # Премахваме ключове с None
@@ -234,13 +195,18 @@ def process_transcribe_media(
                 "temperature": ("list" if isinstance(temperature_param, list) else temperature_param),
                 "initial_prompt": bool(initial_prompt),
                 "normalize_bg": normalize_bg,
+                "profile": profile,
             },
             ensure_ascii=False,
         ),
     )
-    logger.info("Initial prompt enabled: %s (len=%d)",
+    # Показваме само първите 120 знака от промпта за верификация
+    log_prompt_preview = (initial_prompt or "")[:120].replace("\n", " ")
+    logger.info("Initial prompt enabled: %s (len=%d) | preview: %s%s",
                 "YES" if initial_prompt else "NO",
-                len(initial_prompt or ""))
+                len(initial_prompt or ""),
+                log_prompt_preview,
+                "…" if initial_prompt and len(initial_prompt) > 120 else "")
 
     text = None
     srt_text = None
@@ -268,13 +234,11 @@ def process_transcribe_media(
                     seg_text = (seg.get("text") or "").strip()
                     if not seg_text:
                         continue
-
                     words = seg_text.split()
                     seg_start = float(seg.get("start", 0.0))
                     seg_end = float(seg.get("end", seg_start))
 
                     if words and seg.get("words"):
-                        # Истински word timestamps от Whisper
                         for w in seg["words"]:
                             w_text = (w.get("word") or "").strip()
                             w_start = float(w.get("start", seg_start))
@@ -283,7 +247,6 @@ def process_transcribe_media(
                                 all_words.append(w_text)
                                 word_timings.append((w_start, w_end))
                     else:
-                        # Линейно разпределение в рамките на сегмента
                         if words:
                             dur = max(0.0, seg_end - seg_start)
                             per = dur / len(words) if len(words) else 0.0
