@@ -1,20 +1,6 @@
-# Copyright (c) 2025 Stephen G. Pope
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-
+# routes/v1/media/media_transcribe.py
+# Copyright (c) 2025
+# GPL-2.0-or-later
 
 from flask import Blueprint
 from app_utils import *
@@ -23,9 +9,13 @@ import os
 from services.v1.media.media_transcribe import process_transcribe_media
 from services.authentication import authenticate
 from services.cloud_storage import upload_file
+import inspect
 
 v1_media_transcribe_bp = Blueprint('v1_media_transcribe', __name__)
 logger = logging.getLogger(__name__)
+
+# runtime fingerprint: shows which service file was imported
+logger.info("USING process_transcribe_media FROM: %s", inspect.getsourcefile(process_transcribe_media))
 
 @v1_media_transcribe_bp.route('/v1/media/transcribe', methods=['POST'])
 @authenticate
@@ -54,22 +44,23 @@ def transcribe(job_id, data):
     include_text = data.get('include_text', True)
     include_srt = data.get('include_srt', False)
     include_segments = data.get('include_segments', False)
-    word_timestamps = data.get('word_timestamps', False)
+    word_timestamps = data.get('word_timestamps', False)  # ignored in parity
     response_type = data.get('response_type', 'direct')
-    language = data.get('language', None)
+    language = data.get('language', None)                 # ignored in parity
     webhook_url = data.get('webhook_url')
     id = data.get('id')
-    words_per_line = data.get('words_per_line', None)
+    words_per_line = data.get('words_per_line', None)     # ignored in parity
 
     logger.info(f"Job {job_id}: Received transcription request for {media_url}")
 
     try:
-        result = process_transcribe_media(media_url, task, include_text, include_srt, include_segments, word_timestamps, response_type, language, job_id, words_per_line)
+        result = process_transcribe_media(
+            media_url, task, include_text, include_srt, include_segments,
+            word_timestamps, response_type, language, job_id, words_per_line
+        )
         logger.info(f"Job {job_id}: Transcription process completed successfully")
 
-        # If the result is a file path, upload it using the unified upload_file() method
         if response_type == "direct":
-           
             result_json = {
                 "text": result[0],
                 "srt": result[1],
@@ -78,11 +69,9 @@ def transcribe(job_id, data):
                 "srt_url": None,
                 "segments_url": None,
             }
-
             return result_json, "/v1/transcribe/media", 200
 
         else:
-
             cloud_urls = {
                 "text": None,
                 "srt": None,
@@ -92,15 +81,13 @@ def transcribe(job_id, data):
                 "segments_url": upload_file(result[2]) if include_segments is True else None,
             }
 
-            if include_text is True:
-                os.remove(result[0])  # Remove the temporary file after uploading
-            
-            if include_srt is True:
+            if include_text is True and result[0]:
+                os.remove(result[0])
+            if include_srt is True and result[1]:
                 os.remove(result[1])
-
-            if include_segments is True:
+            if include_segments is True and result[2]:
                 os.remove(result[2])
-            
+
             return cloud_urls, "/v1/transcribe/media", 200
 
     except Exception as e:
