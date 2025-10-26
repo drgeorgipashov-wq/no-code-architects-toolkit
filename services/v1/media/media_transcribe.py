@@ -16,8 +16,11 @@ from config import LOCAL_STORAGE_PATH
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+logger.info("USING SERVICE FILE: %s", __file__)  # runtime fingerprint
 
+# -----------------------------
 # Safer env parsing
+# -----------------------------
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -34,7 +37,9 @@ def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
 
-# FFmpeg -> clean mono 16 kHz WAV with loudness norm (good for VAD)
+# -----------------------------
+# FFmpeg -> clean mono 16 kHz WAV with loudness norm
+# -----------------------------
 def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
     cmd = [
         "ffmpeg", "-y",
@@ -61,17 +66,19 @@ def _safe_unlink(path: str) -> None:
     except Exception as e:
         logger.warning("Failed to remove temp file %s: %s", path, e)
 
-# ---- ElevenLabs Scribe (STRICT PARITY with website) ----
+# -----------------------------
+# ElevenLabs Scribe (STRICT PARITY with website)
+# -----------------------------
 def _transcribe_with_scribe_parity(wav_path: str):
     """
-    Call ElevenLabs Scribe to match the official website behavior:
-      - model: scribe-v1
+    Match the official ElevenLabs website behavior:
+      - model: scribe-v1 (configurable via ELEVENLABS_STT_MODEL)
       - language: bg
       - punctuation: on
       - timestamps: on
       - diarization: off
       - NO prompt
-    Returns: { "text": str, "segments": [ {start, end, text} ], "words": [...] (if present) }
+    Returns: { "text": str, "segments": [ {start, end, text} ], "words": [...] (optional) }
     """
     api_key = _env_str("ELEVENLABS_API_KEY")
     if not api_key:
@@ -85,14 +92,13 @@ def _transcribe_with_scribe_parity(wav_path: str):
         "Accept": "application/json",
         "User-Agent": "med-notes-stt/1.0",
     }
-    # Force exact parity with the demo
     data = {
         "model_id": model,
         "language_code": "bg",
         "diarize": "false",
         "enable_timestamp": "true",
         "enable_punctuation": "true",
-        # IMPORTANT: do NOT send prompt in parity mode
+        # NOTE: no prompt in parity mode
     }
 
     timeout_s   = _env_int("ELEVENLABS_TIMEOUT", 1200)
@@ -134,6 +140,9 @@ def _transcribe_with_scribe_parity(wav_path: str):
 
     return {"text": text, "segments": segments, "words": words}
 
+# -----------------------------
+# Public entrypoint (used by route)
+# -----------------------------
 def process_transcribe_media(
     media_url,
     task,                  # kept for signature compatibility; ignored in parity
