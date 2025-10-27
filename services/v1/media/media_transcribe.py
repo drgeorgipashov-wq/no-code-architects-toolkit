@@ -1,7 +1,11 @@
 # services/v1/media/media_transcribe.py
 # GPL-2.0-or-later
 
-import os, sys, json, shlex, logging, subprocess, traceback
+import os
+import json
+import shlex
+import logging
+import subprocess
 from datetime import timedelta
 
 import requests
@@ -16,29 +20,26 @@ logging.basicConfig(level=logging.INFO)
 logger.warning("USING SERVICE FILE (active): %s", __file__)
 
 # If somehow 'whisper' is already present, reveal and stop.
+import sys
 if "whisper" in sys.modules:
     mod = sys.modules["whisper"]
     logger.error("❌ Whisper module present in service import. Source: %s", getattr(mod, "__file__", mod))
     raise RuntimeError("Whisper must not be loaded. Use ElevenLabs Scribe.")
 
-# ------------- Safer env parsing -------------
-def _env_bool(name: str, default: bool = False) -> bool:
+# ------------------ env helpers ------------------
+def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    if v is None: return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+    return default if v is None else str(v).strip()
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int = 0) -> int:
     try:
         return int(str(os.getenv(name, str(default))).strip())
     except Exception:
         return default
+# -------------------------------------------------
 
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return default if v is None else str(v).strip()
-# ---------------------------------------------
 
-# FFmpeg -> clean mono 16 kHz WAV with loudness norm (good for VAD)
+# -------- FFmpeg: normalize to clean mono 16 kHz WAV --------
 def _run_ffmpeg_to_wav(src_path: str, dst_path: str) -> None:
     cmd = [
         "ffmpeg", "-y",
@@ -64,35 +65,42 @@ def _safe_unlink(path: str) -> None:
             os.remove(path)
     except Exception as e:
         logger.warning("Failed to remove temp file %s: %s", path, e)
+# -------------------------------------------------------------
 
-# ---- ElevenLabs Scribe (STRICT PARITY with website) ----
-def _transcribe_with_scribe_parity(wav_path: str):
+
+# ---------------- ElevenLabs Scribe v1 ----------------
+ELEVEN_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+
+class ElevenLabsError(Exception):
+    pass
+
+def _scribe_request_fileupload(wav_path: str, lang_hint: str | None) -> dict:
     """
-    Match the official website behavior:
-      - model: scribe-v1
-      - language: bg
-      - punctuation: on
-      - timestamps: on
-      - diarization: off
-      - NO prompt
-    Returns: { "text": str, "segments": [ {start, end, text} ], "words": [...] (if present) }
+    POST multipart/form-data to ElevenLabs Scribe v1.
+    Exactly one of 'file' or 'cloud_storage_url' is required — we use file upload.
+    Returns dict with keys like: text, language_code, language_probability, segments, words.
     """
     api_key = _env_str("ELEVENLABS_API_KEY")
     if not api_key:
-        raise RuntimeError("ELEVENLABS_API_KEY is not set.")
+        raise ElevenLabsError("ELEVENLABS_API_KEY is not set")
 
-    model = _env_str("ELEVENLABS_STT_MODEL", "scribe-v1")
+    # Official model id uses underscore:
+    model_id = _env_str("ELEVENLABS_STT_MODEL", "scribe_v1")
 
-    url = "https://api.elevenlabs.io/v1/speech-to-text"
+    # Force Bulgarian by default for maximum accuracy on BG content.
+    # To allow auto-detect instead, set lang_hint=None (or remove language_code below).
+    language_code = (lang_hint or _env_str("ELEVENLABS_LANGUAGE", "bul")).strip() or "bul"
+
     headers = {
         "xi-api-key": api_key,
         "Accept": "application/json",
-        "User-Agent": "med-notes-stt/1.0",
+        "User-Agent": "nca-toolkit/elevenlabs-stt",
     }
-    # Exact parity config
+
+    # Commonly supported form fields (server will ignore unknowns safely)
     data = {
-        "model_id": model,
-        "language_code": "bg",
+        "model_id": model_id,
+        "language_code": language_code,   # ISO-639-3 (Bulgarian = 'bul')
         "diarize": "false",
         "enable_timestamp": "true",
         "enable_punctuation": "true",
@@ -102,64 +110,94 @@ def _transcribe_with_scribe_parity(wav_path: str):
     max_retries = _env_int("ELEVENLABS_MAX_RETRIES", 3)
     backoff     = float(os.getenv("ELEVENLABS_BACKOFF_BASE", "2.0"))
 
-    logger.info("Scribe(parity) request: model=%s lang=bg diarize=false wts=true punct=true", model)
+    logger.info("Scribe request: model=%s language_code=%s diarize=false timestamps=true punctuation=true",
+                model_id, language_code)
 
     resp = None
     for attempt in range(max_retries):
         try:
             with open(wav_path, "rb") as f:
                 files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
-                resp = requests.post(url, headers=headers, data=data, files=files, timeout=timeout_s)
+                resp = requests.post(ELEVEN_STT_URL, headers=headers, data=data, files=files, timeout=timeout_s)
             if resp.status_code in (429, 500, 502, 503, 504):
                 logger.warning("Scribe attempt %d failed (status=%s). Retrying...", attempt + 1, resp.status_code)
                 import time; time.sleep(backoff * (attempt + 1)); continue
             break
         except requests.RequestException as ex:
             if attempt == max_retries - 1:
-                raise RuntimeError(f"ElevenLabs STT network error: {ex}") from ex
+                raise ElevenLabsError(f"ElevenLabs STT network error: {ex}") from ex
             logger.warning("Scribe attempt %d network error: %s. Retrying...", attempt + 1, ex)
             import time; time.sleep(backoff * (attempt + 1))
 
     if resp is None:
-        raise RuntimeError("ElevenLabs STT failed: no response")
+        raise ElevenLabsError("ElevenLabs STT failed: no response")
 
     if resp.status_code != 200:
-        raise RuntimeError(f"ElevenLabs STT failed: {resp.status_code} {resp.text[:500]}")
+        raise ElevenLabsError(f"ElevenLabs STT failed: {resp.status_code} {resp.text[:500]}")
 
     try:
-        payload = resp.json()
+        return resp.json() or {}
     except ValueError:
-        raise RuntimeError(f"ElevenLabs STT returned non-JSON: {resp.text[:500]}")
+        raise ElevenLabsError(f"ElevenLabs STT returned non-JSON: {resp.text[:500]}")
+# -----------------------------------------------------
 
-    text = payload.get("text", "") or ""
-    segments = payload.get("segments") or []
-    words = payload.get("words") or []
 
-    return {"text": text, "segments": segments, "words": words}
+# ----------------- Helpers to format outputs -----------------
+def _segments_to_srt(segments: list) -> str:
+    """
+    Compose SRT strictly from Scribe's 'segments' (no local regrouping).
+    """
+    if not segments:
+        return ""
+    subs = []
+    idx = 1
+    for seg in segments:
+        start = float(seg.get("start", 0.0))
+        end   = float(seg.get("end", start))
+        if end < start:
+            end = start
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        subs.append(srt.Subtitle(idx, timedelta(seconds=start), timedelta(seconds=end), text))
+        idx += 1
+    return srt.compose(subs)
 
+def _words_or_segments(words: list, want_segments: bool) -> str | list | None:
+    """
+    If include_segments=True, prefer 'segments' (handled in caller).
+    If word_timestamps=True, return words list; else None.
+    (Kept for backward compat with previous API.)
+    """
+    return words if want_segments else None
+# -------------------------------------------------------------
+
+
+# ------------------- Main service entry ----------------------
 def process_transcribe_media(
     media_url,
-    task,                  # kept for signature compatibility; ignored in parity
+    task,                  # kept for signature compatibility; Scribe only transcribes
     include_text,
     include_srt,
     include_segments,
-    word_timestamps,       # ignored in parity (timestamps always on)
+    word_timestamps,       # if True (and include_segments is False), we can return words
     response_type,
-    language,              # ignored in parity (always bg)
+    language,              # optional language hint; if not set, we use ELEVENLABS_LANGUAGE or 'bul'
     job_id,
-    words_per_line=None    # ignored in parity (use Scribe segments only)
+    words_per_line=None    # unused; we stick to Scribe segments
 ):
     """
-    Bulgarian transcription that mirrors ElevenLabs website output.
-    Returns text/SRT/segments or file paths, depending on response_type.
+    Bulgarian transcription via ElevenLabs Scribe v1.
+    Returns (text | text_path, srt | srt_path, segments_json | segments_path)
+    depending on response_type == "direct" or "cloud" (handled by the route).
     """
-    logger.info("Starting transcribe(parity) for media URL: %s", media_url)
+    logger.info("Starting transcribe with Scribe v1 for: %s (job=%s)", media_url, job_id)
 
-    # 1) Download
+    # 1) Download source media to a temp file
     input_filename = download_file(media_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
-    logger.info("Downloaded media to local file: %s", input_filename)
+    logger.info("Downloaded media: %s", input_filename)
 
-    # 2) Normalize to clean WAV
+    # 2) Normalize to clean WAV (mono, 16 kHz) for robust upload
     clean_wav = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_clean.wav")
     _run_ffmpeg_to_wav(input_filename, clean_wav)
 
@@ -168,41 +206,35 @@ def process_transcribe_media(
     segments_json = None
 
     try:
-        # 3) Scribe (strict parity)
-        el = _transcribe_with_scribe_parity(clean_wav)
-        text = el["text"] or ""
-        segs = el["segments"] or []
+        # 3) Call Scribe v1
+        payload = _scribe_request_fileupload(clean_wav, (language or "").strip() or None)
 
-        # 4) SRT from Scribe segments ONLY (no local re-chunking)
+        text_out = payload.get("text", "") or ""
+        segments = payload.get("segments") or []
+        words    = payload.get("words") or []
+
+        # 4) Outputs
+        if include_text:
+            text = text_out
+
         if include_srt:
-            subs, idx = [], 1
-            if segs:
-                for seg in segs:
-                    start = float(seg.get("start", 0.0))
-                    end   = float(seg.get("end", start))
-                    if end < start:
-                        end = start
-                    seg_text = (seg.get("text") or "").strip()
-                    if seg_text:
-                        subs.append(srt.Subtitle(idx, timedelta(seconds=start), timedelta(seconds=end), seg_text))
-                        idx += 1
-            elif text:
-                subs.append(srt.Subtitle(1, timedelta(seconds=0), timedelta(seconds=0), text))
-            srt_text = srt.compose(subs)
+            srt_text = _segments_to_srt(segments) if segments else ""
 
-        # 5) Segments JSON (unaltered, website-like)
         if include_segments:
-            segments_json = json.dumps(segs, ensure_ascii=False)
+            # Return Scribe's segments JSON unchanged (closest to website output)
+            segments_json = json.dumps(segments, ensure_ascii=False)
+        elif word_timestamps:
+            # If caller asked for word timestamps but not segments, return words instead
+            segments_json = json.dumps(words, ensure_ascii=False)
 
-        logger.info("Generated outputs: text=%s, srt=%s, segments=%s", bool(text), bool(srt_text), bool(segments_json))
+        logger.info("Outputs prepared: text=%s srt=%s segments/words=%s",
+                    bool(text), bool(srt_text), bool(segments_json))
 
-        # 6) Cleanup temps
+        # 5) Cleanup temp files
         _safe_unlink(input_filename)
         _safe_unlink(clean_wav)
 
-        logger.info("Transcribe successful, output type: %s", response_type)
-
-        # 7) Return direct or write to files
+        # 6) Direct vs Cloud response (route will upload files if paths are returned)
         if response_type == "direct":
             return text, srt_text, segments_json
         else:
@@ -220,7 +252,7 @@ def process_transcribe_media(
                 with open(srt_filename, "w", encoding="utf-8") as f:
                     f.write(srt_text or "")
 
-            if include_segments:
+            if include_segments or word_timestamps:
                 segments_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}.json")
                 with open(segments_filename, "w", encoding="utf-8") as f:
                     f.write(segments_json or "[]")
@@ -228,7 +260,9 @@ def process_transcribe_media(
             return text_filename, srt_filename, segments_filename
 
     except Exception as e:
+        # Ensure cleanup on failure
         _safe_unlink(input_filename)
         _safe_unlink(clean_wav)
         logger.error("Transcribe failed: %s", str(e))
         raise
+# -------------------------------------------------------------
