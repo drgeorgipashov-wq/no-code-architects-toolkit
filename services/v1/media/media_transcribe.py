@@ -1,11 +1,7 @@
 # services/v1/media/media_transcribe.py
 # GPL-2.0-or-later
 
-import os
-import json
-import shlex
-import logging
-import subprocess
+import os, sys, json, shlex, logging, subprocess, traceback
 from datetime import timedelta
 
 import requests
@@ -18,6 +14,12 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 logger.warning("USING SERVICE FILE (active): %s", __file__)
+
+# If somehow 'whisper' is already present, reveal and stop.
+if "whisper" in sys.modules:
+    mod = sys.modules["whisper"]
+    logger.error("❌ Whisper module present in service import. Source: %s", getattr(mod, "__file__", mod))
+    raise RuntimeError("Whisper must not be loaded. Use ElevenLabs Scribe.")
 
 # ------------- Safer env parsing -------------
 def _env_bool(name: str, default: bool = False) -> bool:
