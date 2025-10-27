@@ -3,40 +3,48 @@
 
 from flask import Blueprint
 from app_utils import *
-import logging
-import os
-import sys
-import types
-import inspect
+import logging, os, sys, types, inspect, traceback
 
-# ---------- HARD BLOCK WHISPER GLOBALLY ----------
+v1_media_transcribe_bp = Blueprint('v1_media_transcribe', __name__)
 logger = logging.getLogger(__name__)
-_block = str(os.getenv("BLOCK_WHISPER", "1")).strip().lower() in ("1", "true", "yes", "y", "on")
 
-if _block:
-    if "whisper" in sys.modules:
-        mod = sys.modules["whisper"]
-        logger.error("Whisper already imported from: %s", getattr(mod, "__file__", mod))
-        raise RuntimeError("Whisper must not be imported anywhere in this app.")
-    # Create a dummy module that explodes if used
-    m = types.ModuleType("whisper")
-    def _nope(*a, **k):
-        raise RuntimeError("Whisper is DISABLED in this build. Use ElevenLabs Scribe.")
-    m.load_model = _nope
-    sys.modules["whisper"] = m
-    logger.warning("Whisper import is now BLOCKED at runtime (BLOCK_WHISPER=1).")
-# --------------------------------------------------
+# ---------- HARD BLOCK: prevent importing 'whisper' anywhere ----------
+BLOCK = str(os.getenv("BLOCK_WHISPER", "1")).strip().lower() in ("1", "true", "yes", "y", "on")
 
+class _BlockWhisperFinder:
+    """Meta-path finder that blocks 'whisper' imports and logs a full stack."""
+    def find_spec(self, fullname, path, target=None):
+        if not BLOCK:
+            return None
+        if fullname == "whisper" or fullname.startswith("whisper."):
+            logger.error("⚠️  Import of '%s' blocked. Import stack:\n%s",
+                         fullname, "".join(traceback.format_stack()))
+            raise RuntimeError("Whisper import blocked (BLOCK_WHISPER=1). Use ElevenLabs Scribe.")
+        return None
+
+# If already imported, reveal who did it and stop.
+if BLOCK and "whisper" in sys.modules:
+    mod = sys.modules["whisper"]
+    logger.error("❌ Whisper ALREADY imported from: %s", getattr(mod, "__file__", mod))
+    raise RuntimeError("Whisper must not be imported anywhere in this app.")
+
+# Install the global import blocker (even for future imports).
+if BLOCK:
+    # Put our finder at the front so it runs before normal importers.
+    sys.meta_path.insert(0, _BlockWhisperFinder())
+    logger.warning("Whisper imports are globally BLOCKED (BLOCK_WHISPER=1).")
+
+# ---------------------------------------------------------------------
+
+# Import the service AFTER installing the block
 from services.v1.media import media_transcribe as svc
 from services.v1.media.media_transcribe import process_transcribe_media
 from services.authentication import authenticate
 from services.cloud_storage import upload_file
 
-v1_media_transcribe_bp = Blueprint('v1_media_transcribe', __name__)
-
-# Fingerprint: show exactly which service file/function we are using
+# Fingerprint which service file/function is live
 try:
-    logger.warning("USING SERVICE FILE: %s", inspect.getsourcefile(svc) or str(svc))
+    logger.warning("USING SERVICE MODULE FILE: %s", inspect.getsourcefile(svc) or str(svc))
     logger.warning("USING process_transcribe_media FROM: %s",
                    inspect.getsourcefile(process_transcribe_media) or str(process_transcribe_media))
 except Exception as _e:
@@ -65,18 +73,19 @@ except Exception as _e:
 @queue_task_wrapper(bypass_queue=False)
 def transcribe(job_id, data):
     media_url = data['media_url']
-    task = data.get('task', 'transcribe')  # ignored by service (kept for API compatibility)
+    task = data.get('task', 'transcribe')  # kept for API compatibility
     include_text = data.get('include_text', True)
     include_srt = data.get('include_srt', False)
     include_segments = data.get('include_segments', False)
-    word_timestamps = data.get('word_timestamps', False)  # ignored in parity
+    word_timestamps = data.get('word_timestamps', False)
     response_type = data.get('response_type', 'direct')
-    language = data.get('language', None)  # ignored in parity
+    language = data.get('language', None)
     webhook_url = data.get('webhook_url')
-    id = data.get('id')
-    words_per_line = data.get('words_per_line', None)  # ignored in parity
+    req_id = data.get('id')
+    words_per_line = data.get('words_per_line', None)
 
     logger.info(f"Job {job_id}: Received transcription request for {media_url}")
+    logger.info("Calling process_transcribe_media from %s", inspect.getsourcefile(process_transcribe_media))
 
     try:
         result = process_transcribe_media(
@@ -86,34 +95,32 @@ def transcribe(job_id, data):
         logger.info(f"Job {job_id}: Transcription process completed successfully")
 
         if response_type == "direct":
-            result_json = {
+            return {
                 "text": result[0],
                 "srt": result[1],
                 "segments": result[2],
                 "text_url": None,
                 "srt_url": None,
                 "segments_url": None,
-            }
-            return result_json, "/v1/transcribe/media", 200
+            }, "/v1/transcribe/media", 200
 
-        else:
-            cloud_urls = {
-                "text": None,
-                "srt": None,
-                "segments": None,
-                "text_url": upload_file(result[0]) if include_text else None,
-                "srt_url": upload_file(result[1]) if include_srt else None,
-                "segments_url": upload_file(result[2]) if include_segments else None,
-            }
+        cloud_urls = {
+            "text": None,
+            "srt": None,
+            "segments": None,
+            "text_url": upload_file(result[0]) if include_text else None,
+            "srt_url": upload_file(result[1]) if include_srt else None,
+            "segments_url": upload_file(result[2]) if include_segments else None,
+        }
 
-            if include_text and result[0]:
-                os.remove(result[0])
-            if include_srt and result[1]:
-                os.remove(result[1])
-            if include_segments and result[2]:
-                os.remove(result[2])
+        if include_text and result[0]:
+            os.remove(result[0])
+        if include_srt and result[1]:
+            os.remove(result[1])
+        if include_segments and result[2]:
+            os.remove(result[2])
 
-            return cloud_urls, "/v1/transcribe/media", 200
+        return cloud_urls, "/v1/transcribe/media", 200
 
     except Exception as e:
         logger.error(f"Job {job_id}: Error during transcription process - {str(e)}")
