@@ -1,5 +1,6 @@
 # services/v1/media/media_transcribe.py
 # GPL-2.0-or-later
+# ElevenLabs Scribe v1 implementation (replaces Whisper)
 
 import os
 import json
@@ -18,6 +19,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 logger.warning("USING SERVICE FILE (active): %s", __file__)
+logger.warning("### USING ELEVENLABS SCRIBE SERVICE ###")
 
 # If somehow 'whisper' is already present, reveal and stop.
 import sys
@@ -88,7 +90,7 @@ def _scribe_request_fileupload(wav_path: str, lang_hint: str | None) -> dict:
     model_id = _env_str("ELEVENLABS_STT_MODEL", "scribe_v1")
 
     # Force Bulgarian by default for maximum accuracy on BG content.
-    # To allow auto-detect instead, set lang_hint=None (or remove language_code below).
+    # To allow auto-detect instead, set lang_hint=None (or set ELEVENLABS_LANGUAGE to empty).
     language_code = (lang_hint or _env_str("ELEVENLABS_LANGUAGE", "bul")).strip() or "bul"
 
     headers = {
@@ -162,14 +164,6 @@ def _segments_to_srt(segments: list) -> str:
         subs.append(srt.Subtitle(idx, timedelta(seconds=start), timedelta(seconds=end), text))
         idx += 1
     return srt.compose(subs)
-
-def _words_or_segments(words: list, want_segments: bool) -> str | list | None:
-    """
-    If include_segments=True, prefer 'segments' (handled in caller).
-    If word_timestamps=True, return words list; else None.
-    (Kept for backward compat with previous API.)
-    """
-    return words if want_segments else None
 # -------------------------------------------------------------
 
 
@@ -180,7 +174,7 @@ def process_transcribe_media(
     include_text,
     include_srt,
     include_segments,
-    word_timestamps,       # if True (and include_segments is False), we can return words
+    word_timestamps,       # if True (and include_segments is False), we can return words (not used here)
     response_type,
     language,              # optional language hint; if not set, we use ELEVENLABS_LANGUAGE or 'bul'
     job_id,
@@ -211,7 +205,7 @@ def process_transcribe_media(
 
         text_out = payload.get("text", "") or ""
         segments = payload.get("segments") or []
-        words    = payload.get("words") or []
+        words    = payload.get("words") or []  # available if you ever want raw words
 
         # 4) Outputs
         if include_text:
